@@ -1,0 +1,23 @@
+import hou
+
+network = hou.ui.curDesktop().paneTabUnderCursor()
+networkpath = network.pwd().path()
+pos = network.cursorPosition()
+
+clipboard = hou.ui.getTextFromClipboard()
+
+n = 0
+
+if clipboard:
+    list = clipboard.split()
+    for item in list:
+        if hou.node(item) != None:
+            merge = hou.node(networkpath).createNode('object_merge','merge_'+item.split('/')[-1])
+            merge.parm('objpath1').set(str(item))
+            merge.setPosition(pos)
+            merge.move([n*2,0])
+            if n == 0:
+                merge.setSelected(True,True)
+            else:
+                merge.setSelected(True,False)
+            n = n + 1

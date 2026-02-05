@@ -1,0 +1,468 @@
+import hou
+import os
+import re
+
+try:
+    from PySide6 import QtWidgets, QtCore, QtGui
+except ImportError:
+    from PySide2 import QtWidgets, QtCore, QtGui
+
+
+RES_ORDER = ["512", "1k", "2k", "4k", "8k", "16k", "32k"]
+EXTS = [".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+
+MAP_SUFFIX = {
+    "albedo": ["_albedo", "_basecolor", "_diffuse", "_color"],
+    "ao": ["_ao", "_ambientocclusion"],
+    "roughness": ["_roughness", "_specular"],
+    "normal": ["_normal", "_nor"],
+    "displacement": ["_disp", "_height", "_displacement"],
+    "opacity": ["_opacity", "_alpha", "_mask"],
+    "trans_am": ["_trans", "_translucency", "_sss"],
+    "trans_col": ["_trans", "_translucency", "_sss"],
+}
+
+NODE_MAP = {
+    "albedo": "Albedo",
+    "ao": "AO",
+    "roughness": "Roughness",
+    "normal": "Normal",
+    "displacement": "Displacement",
+    "opacity": "Opacity",
+    "trans_am": "Translucency_amount",
+    "trans_col": "Translucency_color",
+}
+
+SWITCH_MAP = {
+    "albedo": "Albedo_Switch",
+    "ao": "AO_Switch",
+    "roughness": "Roughness_Switch",
+    "normal": "Normal_Switch",
+    "displacement": "Displacement_Switch",
+    "opacity": "Opacity_switch",
+    "trans_am": "Translucency_amount_switch",
+    "trans_col": "Translucency_color_switch",
+}
+
+
+def scan_main_files(folder):
+    out = {}
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d.lower() != "thumbs"]
+        for f in files:
+            out[f.lower()] = os.path.join(root, f)
+    return out
+
+
+def extract_res(b):
+    m = re.search(r"_(512|1k|2k|4k|8k|16k|32k)$", b, re.IGNORECASE)
+    return m.group(1).lower() if m else None
+
+
+def strip_res(b):
+    return re.sub(r"_(512|1k|2k|4k|8k|16k|32k)$", "", b)
+
+
+def detect_materials(files):
+    mats = {}
+    for fname in files:
+        base, ext = os.path.splitext(fname)
+        if ext not in EXTS:
+            continue
+
+        mtype = None
+        suf = None
+        for t, sufs in MAP_SUFFIX.items():
+            for s in sufs:
+                if base.endswith(s):
+                    mtype = t
+                    suf = s
+                    break
+            if mtype:
+                break
+        if not mtype:
+            continue
+
+        root = base[:-len(suf)]
+        res = extract_res(root)
+        pure = strip_res(root) if res else root
+        mats.setdefault(pure, set()).add(res if res else "nores")
+
+    out = []
+    for mat, rset in mats.items():
+        if rset == {"nores"}:
+            out.append((mat, ["nores"]))
+        else:
+            out.append((mat, [r for r in RES_ORDER if r in rset]))
+    return out
+
+
+def find_tex(mat, res, ttype, files):
+    if res == "nores":
+        for suf in MAP_SUFFIX[ttype]:
+            for ext in EXTS:
+                fn = f"{mat}{suf}{ext}".lower()
+                if fn in files:
+                    return files[fn]
+        return None
+    for suf in MAP_SUFFIX[ttype]:
+        for ext in EXTS:
+            fn = f"{mat}_{res}{suf}{ext}".lower()
+            if fn in files:
+                return files[fn]
+    return None
+
+
+def find_folder_origin(path):
+    return os.path.basename(os.path.dirname(path)) if path else "?"
+
+
+def clear_all(builder):
+    for c in builder.children():
+        if c.type().name() == "mtlximage":
+            p = c.parm("file")
+            if p:
+                p.set("")
+    for sw in SWITCH_MAP.values():
+        n = builder.node(sw)
+        if n and n.parm("which"):
+            n.parm("which").set(1)
+
+
+def apply_tex(builder, mat, res, files):
+    clear_all(builder)
+    found = {}
+
+    for t in MAP_SUFFIX:
+        p = find_tex(mat, res, t, files)
+        node = builder.node(NODE_MAP[t])
+        if p and node:
+            node.parm("file").set(p)
+            found[t] = True
+        else:
+            found[t] = False
+
+    for t, sw in SWITCH_MAP.items():
+        w = builder.node(sw)
+        if w:
+            w.parm("which").set(0 if found[t] else 1)
+
+
+class MaterialTable(QtWidgets.QDialog):
+    def __init__(self, files, mats, showprev):
+        super().__init__()
+
+        self.files = files
+        self.mats = mats
+        self.showprev = showprev
+
+        self.reslists = {m: r for m, r in mats}
+        self.res_widgets = {}
+        self.preview_labels = {}
+
+        self.setWindowTitle("Material Overview")
+        self.resize(1600, 900)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel("Global Override:"))
+        self.overrideCB = QtWidgets.QComboBox()
+        self.overrideCB.addItems(["Off", "Highest", "Lowest"])
+        top.addWidget(self.overrideCB)
+        top.addStretch()
+        layout.addLayout(top)
+
+        cols = ["Resolution", "Material", "Folder Source"]
+        if showprev:
+            cols.append("Preview")
+        cols.extend([
+            "Albedo", "AO", "Roughness", "Normal",
+            "Displacement", "Opacity", "Translucency"
+        ])
+
+        self.table = QtWidgets.QTableWidget(len(mats), len(cols))
+        self.table.setHorizontalHeaderLabels(cols)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+
+        self.table.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+        header = self.table.horizontalHeader()
+        for i in range(len(cols)):
+            header.setSectionResizeMode(i, QtWidgets.QHeaderView.Interactive)
+
+        header.setSectionResizeMode(len(cols) - 1, QtWidgets.QHeaderView.Stretch)
+        header.setDefaultSectionSize(160)
+        header.setMinimumSectionSize(60)
+
+        self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        layout.addWidget(self.table)
+
+        for row, (mat, rl) in enumerate(mats):
+
+            # ---------------------
+            # Resolution
+            # ---------------------
+            if rl == ["nores"]:
+                it = QtWidgets.QTableWidgetItem("—")
+                it.setFlags(QtCore.Qt.ItemIsEnabled)
+                it.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.table.setItem(row, 0, it)
+                self.res_widgets[mat] = None
+
+            elif len(rl) == 1:
+                it = QtWidgets.QTableWidgetItem(rl[0])
+                it.setFlags(QtCore.Qt.ItemIsEnabled)
+                it.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.table.setItem(row, 0, it)
+                self.res_widgets[mat] = None
+
+            else:
+                cb = QtWidgets.QComboBox()
+                cb.addItems(rl)
+                cb.setCurrentText(rl[-1])
+                cb.currentIndexChanged.connect(lambda x, m=mat: self.update_preview(m))
+                self.table.setCellWidget(row, 0, cb)
+                self.res_widgets[mat] = cb
+
+            # ---------------------
+            # Material (MITTIG)
+            # ---------------------
+            name_item = QtWidgets.QTableWidgetItem(mat)
+            name_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.table.setItem(row, 1, name_item)
+
+            # ---------------------
+            # Folder Source
+            # ---------------------
+            p = find_tex(mat, rl[-1], "albedo", self.files)
+            src = find_folder_origin(p)
+            src_item = QtWidgets.QTableWidgetItem(src)
+            src_item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.table.setItem(row, 2, src_item)
+
+            col = 3
+
+            # ---------------------
+            # Preview
+            # ---------------------
+            if self.showprev:
+                lab = QtWidgets.QLabel()
+                lab.setFixedSize(100, 100)
+                lab.setScaledContents(True)
+                self.preview_labels[mat] = lab
+                self.table.setCellWidget(row, col, lab)
+                self.update_preview(mat)
+                self.table.setRowHeight(row, 110)
+                col += 1
+            else:
+                self.table.setRowHeight(row, 28)
+
+            # ---------------------
+            # Map Indicators
+            # ---------------------
+            for t in ["albedo", "ao", "roughness", "normal",
+                      "displacement", "opacity", "translucency"]:
+
+                ok = False
+
+                if t == "translucency":
+                    for r in rl:
+                        if find_tex(mat, r, "trans_am", self.files) or find_tex(mat, r, "trans_col", self.files):
+                            ok = True
+                            break
+                else:
+                    for r in rl:
+                        if find_tex(mat, r, t, self.files):
+                            ok = True
+                            break
+
+                it = QtWidgets.QTableWidgetItem("✓" if ok else "✗")
+                it.setTextAlignment(QtCore.Qt.AlignCenter)
+                self.table.setItem(row, col, it)
+                col += 1
+
+        # ---------------------
+        # Override
+        # ---------------------
+        def override():
+            m = self.overrideCB.currentText()
+            if m == "Off":
+                return
+            for mat, rl in self.mats:
+                cb = self.res_widgets.get(mat)
+                if cb:
+                    cb.setCurrentText(rl[-1] if m == "Highest" else rl[0])
+
+        self.overrideCB.currentIndexChanged.connect(override)
+
+        # ---------------------
+        # Bottom Buttons
+        # ---------------------
+        bot = QtWidgets.QHBoxLayout()
+        sel = QtWidgets.QPushButton("Select All")
+        des = QtWidgets.QPushButton("Deselect All")
+        load = QtWidgets.QPushButton("Load Selected")
+        bot.addWidget(sel)
+        bot.addWidget(des)
+        bot.addStretch()
+        bot.addWidget(load)
+        layout.addLayout(bot)
+
+        sel.clicked.connect(self.table.selectAll)
+        des.clicked.connect(self.table.clearSelection)
+        load.clicked.connect(self.accept)
+
+        # ---------------------
+        # Counter
+        # ---------------------
+        self.counterLabel = QtWidgets.QLabel("Selected: 0")
+        self.counterLabel.setAlignment(QtCore.Qt.AlignRight)
+        layout.addWidget(self.counterLabel)
+
+        def update_counter():
+            rows = {i.row() for i in self.table.selectedIndexes()}
+            self.counterLabel.setText(f"Selected: {len(rows)}")
+
+        self.table.itemSelectionChanged.connect(update_counter)
+
+    def update_preview(self, mat):
+        if not self.showprev:
+            return
+
+        lab = self.preview_labels.get(mat)
+        if not lab:
+            return
+
+        rl = self.reslists[mat]
+        cb = self.res_widgets.get(mat)
+        req = cb.currentText() if cb else rl[-1]
+
+        order = [req] + [r for r in reversed(rl) if r != req]
+
+        p = None
+        for r in order:
+            p = find_tex(mat, r, "albedo", self.files)
+            if p:
+                break
+
+        if p:
+            img = QtGui.QImage(p)
+            if not img.isNull():
+                lab.setPixmap(QtGui.QPixmap.fromImage(img))
+                return
+
+        lab.setPixmap(QtGui.QPixmap())
+
+    def get_selection(self):
+        rows = {i.row() for i in self.table.selectedIndexes()}
+        out = []
+        for r in rows:
+            mat, rl = self.mats[r]
+            cb = self.res_widgets.get(mat)
+            res = cb.currentText() if cb else rl[0]
+            out.append((mat, rl, res))
+        return out
+
+
+class Loader(QtWidgets.QDialog):
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+        self.setWindowTitle("Karma Texture Loader")
+        self.setMinimumWidth(600)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        h = QtWidgets.QHBoxLayout()
+        self.path = QtWidgets.QLineEdit()
+        browse = QtWidgets.QPushButton("Browse")
+        h.addWidget(self.path)
+        h.addWidget(browse)
+        layout.addLayout(h)
+
+        self.showPrev = QtWidgets.QCheckBox("Show Preview")
+        layout.addWidget(self.showPrev)
+
+        h2 = QtWidgets.QHBoxLayout()
+        load = QtWidgets.QPushButton("Load Materials")
+        clear = QtWidgets.QPushButton("Clear All")
+        h2.addWidget(load)
+        h2.addWidget(clear)
+        layout.addLayout(h2)
+
+        if hasattr(hou.session, "last_tex_folder"):
+            self.path.setText(hou.session.last_tex_folder)
+
+        browse.clicked.connect(self.onBrowse)
+        load.clicked.connect(self.onLoad)
+        clear.clicked.connect(self.onClear)
+
+    def onBrowse(self):
+        p = hou.ui.selectFile("Select Texture Folder", file_type=hou.fileType.Directory)
+        if p:
+            self.path.setText(hou.expandString(p))
+
+    def onLoad(self):
+        folder = self.path.text()
+        hou.session.last_tex_folder = folder
+
+        files = scan_main_files(folder)
+        mats = detect_materials(files)
+
+        dlg = MaterialTable(files, mats, self.showPrev.isChecked())
+        result = dlg.exec_()
+
+        if result != QtWidgets.QDialog.Accepted:
+            self.close()
+            return
+
+        selected = dlg.get_selection()
+        if not selected:
+            self.close()
+            return
+
+        base = self.net.createNode("preset_builder")
+        base.moveToGoodPosition()
+        base.setSelected(True, True)
+
+        pos = base.position()
+        off = 4
+
+        for i, (mat, rl, res) in enumerate(selected):
+            node = base if i == 0 else base.copyTo(self.net)
+            clean_name = re.sub(r"[^a-zA-Z0-9_-]", "_", mat)
+            node.setName(clean_name, True)
+            node.setPosition(hou.Vector2(pos[0] + i * off, pos[1]))
+            apply_tex(node, mat, res, files)
+
+        hou.ui.displayMessage(f"{len(selected)} materials loaded.")
+        self.close()
+
+    def onClear(self):
+        for c in self.net.children():
+            if c.type().name() == "preset_builder":
+                c.destroy()
+        self.close()
+
+
+
+def main():
+    pane = None
+    for p in hou.ui.currentPaneTabs():
+        if isinstance(p, hou.NetworkEditor):
+            pane = p
+            break
+    if not pane:
+        raise hou.Error("No Network Pane found")
+
+    net = pane.pwd()
+
+    dlg = Loader(net)
+    dlg.setParent(hou.ui.mainQtWindow(), QtCore.Qt.Window)
+    dlg.show()
+
+
+main()
