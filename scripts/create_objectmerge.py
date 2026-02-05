@@ -1,4 +1,4 @@
-///Create IN
+import random
 
 sel = hou.selectedNodes()
 
@@ -10,8 +10,9 @@ if len(sel) == 1:
     mkMerge = curPath.createNode("object_merge")
     mkMerge.setPosition(pos)
     try:
-        mkMerge.setName(sel[0].name() + "_merge")
+        mkMerge.setName(sel[0].name() + "_ref")
     except:
-        mkMerge.setName(sel[0].name() + "_merge1")
+        mkMerge.setName(sel[0].name() + "_ref" + str(random.randint(1,20)))
     mkMerge.parm("xformtype").set(1)
+    mkMerge.setColor(hou.Color((.5,1,.1)))
     mkMerge.parm("objpath1").set(objPath)
